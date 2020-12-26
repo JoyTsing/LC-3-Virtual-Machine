@@ -3,6 +3,33 @@
 #include <stdint.h>
 #include <string.h>
 #include <signal.h>
+
+#ifdef _WIN32
+#include <Windows.h>
+#include <conio.h>
+
+HANDLE hStdin= INVALID_HANDLE_VALUE;
+
+uint16_t check_key(){
+    return waitForSingleObject(hStdin,1000)==WAIT_OBJECT_0 && _kbhit();
+}
+
+DWORD fdwMode,fdwOldMode;
+
+void disable_input_buffering(){
+    hStdin=GetStdHandle(STD_INPUT_HANDLE);
+    GetConsoleMode(hStdin,&fdwOldMode);
+    fdwMode=fdwOldMode
+        ^ ENABLE_ECHO_INPUT
+        ^ ENABLE_LINE_INPUT;
+    SetConsoleMode(hStdin,fdwMode);
+    FlushConsoleInputBuffer(hStdin);
+}
+
+void restore_input_buffering(){
+    SetConsoleMode(hStdin,fdwOldMode);
+}
+#else
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -11,6 +38,42 @@
 #include <sys/termios.h>
 #include <sys/mman.h>
 
+/** Platform Specifics **/
+
+/* get keyboard status */
+uint16_t check_key(){
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(STDIN_FILENO,&readfds);
+
+    struct timeval timeout;
+    timeout.tv_sec=0;
+    timeout.tv_usec=0;
+    return select(1,&readfds,NULL,NULL,&timeout)!=0;
+}
+
+/* terminal input setup */
+struct termios original_tio;
+
+void disable_input_buffering(){
+    tcgetattr(STDIN_FILENO,&original_tio);
+    struct termios new_tio=original_tio;
+    new_tio.c_cflag &= ~ICANON & ~ECHO;
+    tcsetattr(STDIN_FILENO,TCSANOW, &new_tio);
+}
+
+void restore_input_buffering(){
+    tcsetattr(STDIN_FILENO,TCSANOW,&original_tio);
+}
+
+void handle_interrupt(int signal){
+    restore_input_buffering();
+    printf("\n");
+    exit(-2);
+}
+#endif
+
+/* end */
 /* 65536 locations */
 uint16_t memory[UINT16_MAX];
 
@@ -58,7 +121,22 @@ enum{
 };
 
 
+uint16_t sign_extend(uint16_t x,int bit_count){
+    if((x>>(bit_count-1))&1){
+        x|=(0xFFFF<<bit_count);
+    }
+    return x;
+}
 
+void update_flags(uint16_t r){
+    if(reg[r]==0){
+        reg[R_COND]==FL_ZRO;
+    }else if(reg[r]>>15){
+        reg[R_COND]=FL_NEG;
+    }else{
+        reg[R_COND]=FL_POS;
+    }
+}
 
 int read_and_execute_instruction(){
     int running=1;
@@ -69,23 +147,149 @@ int read_and_execute_instruction(){
     uint16_t op=instr>>12;
 
     switch(op){
-        case OP_ADD:break;
-        case OP_AND:break;
-        case OP_NOT:break;
-        case OP_BR:break;
-        case OP_JMP:break;
-        case OP_JSR:break;
-        case OP_LD:break;
-        case OP_LDI:break;
-        case OP_LDR:break;
-        case OP_LEA:break;
-        case OP_ST:break;
-        case OP_STI:break;
-        case OP_STR:break;
-        case OP_TRAP:break;
-        case OP_RES:break;
-        case OP_RTI:break;
+        case OP_ADD:
+            {
+                uint16_t dr=(instr>>9)&0x7;
+                uint16_t sr1=(instr>>6)&0x7;
+                uint16_t imm_flag=(instr>>5)&0x1;
+                if(imm_flag){
+                    uint16_t imm5=sign_extend(instr&0x1f,5);
+                    reg[dr]=reg[sr1]+imm5;
+                }else{
+                    uint16_t sr2=instr&0x7;
+                    reg[dr]=reg[sr1]+reg[sr2];
+                }
+                update_flags(dr);
+            }
+            break;
+        case OP_AND:
+            {
+                uint16_t dr=(instr>>9)&0x7;
+                uint16_t sr1=(instr>>6)&0x7;
+                uint16_t imm_flag=(instr>>5)&0x1;
+                if(imm_flag){
+                    uint16_t imm5=sign_extend(instr&0x1f,5);
+                    reg[dr]=reg[sr1]&imm5;
+                }else{
+                    uint16_t sr2=instr&0x7;
+                    reg[dr]=reg[sr1]&reg[sr2];
+                }
+                update_flags(dr);
+            }
+            break;
+        case OP_NOT:
+            {
+                uint16_t dr=(instr>>9)&0x7;
+                uint16_t sr=(instr>>6)&0x7;
+                reg[dr]=~reg[sr];
+                update_flags(dr);
+            }
+            break;
+        case OP_BR:
+            {
+                uint16_t n_flag=(instr>>11)&0x1;
+                uint16_t z_flag=(instr>>10)&0x1;
+                uint16_t p_flag=(instr>>9) &0x1;
+
+                /* PCoffset 9 */
+                uint16_t pc_offset=sign_extend(instr&0x1ff,9);
+                /*
+                 * n_flag is set and negatiev condition flag is set
+                 * z_flag is set and zero condition flag is set
+                 * p_flag is set and positive condition flag is set
+                 * */
+                if((n_flag && (reg[R_COND]& FL_NEG))||
+                   (z_flag && (reg[R_COND]& FL_ZRO))||
+                   (p_flag && (reg[R_COND]& FL_POS))){
+                    reg[R_PC]+=pc_offset;
+                }
+            }
+            break;
+        case OP_JMP:
+            {
+                uint16_t base_r=(instr>>6)&0x7;
+                reg[R_PC]=reg[base_r];
+            }
+            break;
+        case OP_JSR:
+            {
+                /* save pc in R7 to jump back to later */
+                reg[R_R7]=reg[R_PC];
+                uint16_t imm_flag=(instr>>11)&0x1;
+                if(imm_flag){
+                    uint16_t pc_offset=sign_extend(instr&0x7ff,11);
+                    reg[R_PC]+=pc_offset;
+                }else{
+                    uint16_t base_r=(instr>>6)&0x7;
+                    reg[R_PC]=reg[base_r];
+                }
+            }
+            break;
+        case OP_LD:
+            {
+                uint16_t dr=(instr>>9)&0x7;
+                uint16_t pc_offset=sign_extend(instr&0x1ff,9);
+                /* add pc_offset to the current pc and load that memory location */
+                reg[dr]=mem_read(reg[R_PC]+pc_offset);
+                update_flags(dr);
+            }
+            break;
+        case OP_LDI:
+            {
+                uint16_t dr=(instr>>9)&0x7;
+                uint16_t pc_offset=sign_extend(instr&0x1ff,9);
+                /* add pc_offset to the current PC, look at that memory
+                 * location to get the final address */
+                reg[dr]=mem_read(mem_read(reg[R_PC]+pc_offset));
+                update_flags(dr);
+            }
+            break;
+        case OP_LDR:
+            {
+                uint16_t dr=(instr>>9)&0x7;
+                uint16_t base_r=(instr>>6)&0x7;
+                uint16_t offset=sign_extend(instr&0x3f,6);
+                reg[dr]=mem_read(reg[base_r]+offset);
+                update_flags(dr);
+            }
+            break;
+        case OP_LEA:
+            {
+                uint16_t dr=(instr>>9)&0x7;
+                uint16_t pc_offset=sign_extend(instr&0x1ff,9);
+                reg[dr]=reg[R_PC]+pc_offset;
+                update_flags(dr);
+            }
+            break;
+        case OP_ST:
+            {
+                uint16_t sr=(instr>>9)&0x7;
+                uint16_t pc_offset=sign_extend(instr&0x1ff,9);
+                mem_write(reg[R_PC]+pc_offset,reg[sr]);
+            }
+            break;
+        case OP_STI:
+            {
+                uint16_t sr=(instr>>9)&0x7;
+                uint16_t pc_offset=sign_extend(instr&0x1ff,9);
+                mem_write(mem_read(reg[R_PC]+pc_offset),reg[sr]);
+            }
+            break;
+        case OP_STR:
+            {
+                uint16_t sr=(instr>>9)&0x7;
+                uint16_t base_r=(instr>>6)&0x7;
+                uint16_t offset=sign_extend(instr& 0x3f,6);
+                mem_write(reg[base_r]+offset,reg[sr]);
+            }
+            break;
+        case OP_TRAP:
+            running=execute_trap(instr,stdin,stdout);
+            break;
+        case OP_RES:
+        case OP_RTI:
         default:
+            abort();
             break;
     }
 
@@ -97,41 +301,6 @@ int read_and_execute_instruction(){
     return running;
 }
 
-/** Platform Specifics **/
-
-/* get keyboard status */
-uint16_t check_key(){
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(STDIN_FILENO,&readfds);
-
-    struct timeval timeout;
-    timeout.tv_sec=0;
-    timeout.tv_usec=0;
-    return select(1,&readfds,NULL,NULL,&timeout)!=0;
-}
-
-/* terminal input setup */
-struct termios original_tio;
-
-void disable_input_buffering(){
-    tcgetattr(STDIN_FILENO,&original_tio);
-    struct termios new_tio=original_tio;
-    new_tio.c_cflag &= ~ICANON & ~ECHO;
-    tcsetattr(STDIN_FILENO,TCSANOW, &new_tio);
-}
-
-void restore_input_buffering(){
-    tcsetattr(STDIN_FILENO,TCSANOW,&original_tio);
-}
-
-void handle_interrupt(int signal){
-    restore_input_buffering();
-    printf("\n");
-    exit(-2);
-}
-
-/* end */
 
 /** Tests **/
 int test_add_instr_1(){
