@@ -148,6 +148,69 @@ void update_flags(uint16_t r){
     }
 }
 
+/* execute trap routine */
+int execute_trap(uint16_t instr,FILE* in,FILE* out){
+    int running=1;
+    switch(instr&0xFF){
+        case TRAP_GETC:
+            {
+                uint16_t c=getc(in);
+                reg[R_R0]=c;
+            }
+            break;
+        case TRAP_OUT:
+            {
+                char c=(char)reg[R_R0&0xff];
+                putc(c,out);
+            }
+            break;
+        case TRAP_PUTS:
+            {
+                uint16_t* word=memory+reg[R_R0];
+                while(*word){
+                    putc((char)(*word&0xff),out);
+                    word++;
+                }
+                fflush(out);
+            }
+            break;
+        case TRAP_IN:
+            {
+                fprintf(out,"Enter a character: ");
+                fflush(out);
+                uint16_t c=getc(in);
+                putc((char)c,out);
+                fflush(out);
+                reg[R_R0]=c;
+            }
+            break;
+        case TRAP_PUTSP:
+            {
+                /* one char per byte(two bytes per word) */
+                uint16_t* word=memory+reg[R_R0];
+                while(*word){
+                    putc((char)(*word&0xff),out);
+                    char c=*word>>8;
+                    if(c){
+                        putc(c,out);
+                    }
+                    word++;
+                }
+                fflush(out);
+            }
+            break;
+        case TRAP_HALT:
+            {
+                fputs("HALT",out);
+                fflush(out);
+                running=0;
+            }
+            break;
+    }
+
+    return running;
+}
+
 int read_and_execute_instruction(){
     int running=1;
     int is_max=R_PC==UINT16_MAX;
